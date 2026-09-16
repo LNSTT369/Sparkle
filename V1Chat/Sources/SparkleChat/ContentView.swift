@@ -468,6 +468,19 @@ class SessionsManager: ObservableObject {
         save()
     }
     
+    func deleteSession(id: UUID) {
+        sessions.removeAll { $0.id == id }
+        if selectedId == id {
+            selectedId = sessions.first?.id
+        }
+        if sessions.isEmpty {
+            let s = ChatSession(title: "New Chat", updatedAt: Date(), messages: [])
+            sessions = [s]
+            selectedId = s.id
+        }
+        save()
+    }
+    
     func updateCurrent(with messages: [Message]) {
         guard let id = selectedId, let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
         let title = messages.first(where: { $0.role == "user" })?.content.prefix(30).description ?? "New Chat"
@@ -485,6 +498,8 @@ struct ContentView: View {
     @FocusState private var focused: Bool
     @State private var showSettings = false
     @AppStorage("hasStarted") private var hasStarted = false
+    @State private var showDeleteConfirm = false
+    @State private var sessionToDelete: UUID? = nil
     
     var body: some View {
         NavigationSplitView {
@@ -520,9 +535,39 @@ struct ContentView: View {
                         }
                         .padding(.vertical, 2)
                         .tag(s.id)
+                        .contextMenu {
+                            Button(role: .destructive, action: {
+                                sessionToDelete = s.id
+                                showDeleteConfirm = true
+                            }) {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive, action: {
+                                sessionToDelete = s.id
+                                showDeleteConfirm = true
+                            }) {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
                     }
                 }
                 .listStyle(.sidebar)
+                .alert("Are you sure?", isPresented: $showDeleteConfirm) {
+                    Button("Cancel", role: .cancel) { sessionToDelete = nil }
+                    Button("Delete", role: .destructive) {
+                        if let id = sessionToDelete {
+                            if sessions.selectedId == id {
+                                model.messages.removeAll()
+                            }
+                            sessions.deleteSession(id: id)
+                            sessionToDelete = nil
+                        }
+                    }
+                } message: {
+                    Text("This chat will be deleted. This cannot be undone.")
+                }
             }
             .frame(minWidth: 180)
             .toolbar(removing: .sidebarToggle)
