@@ -19,7 +19,11 @@ class ChatModel: ObservableObject {
     
     // Opinionated: smallest model, one port, no knobs - streaming
     let endpoint = "http://127.0.0.1:8081/v1/chat/completions"
-    let model = "/Users/user/models/gemma-4-e4b-it-4bit-mlx"
+    var model: String {
+        let bundled = Bundle.main.resourcePath.map { $0 + "/models/gemma-4-e4b-it-4bit-mlx" } ?? ""
+        if FileManager.default.fileExists(atPath: bundled) { return bundled }
+        return NSHomeDirectory() + "/models/gemma-4-e4b-it-4bit-mlx"
+    }
     
     func send() {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -244,9 +248,16 @@ struct OnboardingModel: Identifiable {
         OnboardingModel(id: "qwen3-coder-30b", name: "qwen3-coder:30b", size: "18GB", badge: "Coding", detail: "Like your Ollama • 18GB"),
     ]
     var path: String {
+        let bundled: String
         switch id {
-        case "gemma4-e4b-it-4bit": return NSHomeDirectory() + "/models/gemma-4-e4b-it-4bit-mlx"
-        case "gemma4-e4b-8bit": return NSHomeDirectory() + "/models/gemma-4-e4b-8bit-mlx"
+        case "gemma4-e4b-it-4bit":
+            bundled = (Bundle.main.resourcePath ?? "") + "/models/gemma-4-e4b-it-4bit-mlx"
+            if FileManager.default.fileExists(atPath: bundled) { return bundled }
+            return NSHomeDirectory() + "/models/gemma-4-e4b-it-4bit-mlx"
+        case "gemma4-e4b-8bit":
+            bundled = (Bundle.main.resourcePath ?? "") + "/models/gemma-4-e4b-8bit-mlx"
+            if FileManager.default.fileExists(atPath: bundled) { return bundled }
+            return NSHomeDirectory() + "/models/gemma-4-e4b-8bit-mlx"
         case "qwen3-coder-30b": return NSHomeDirectory() + "/.ollama/models"
         default: return ""
         }
@@ -307,9 +318,32 @@ struct OnboardingCard: View {
     }
 }
 
+struct SettingsView: View {
+    @EnvironmentObject var chat: ChatModel
+    @Environment(\.dismiss) var dismiss
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Settings")
+                .font(.system(size: 14, weight: .semibold))
+            ForEach(OnboardingModel.all) { m in
+                OnboardingCard(model: m).environmentObject(chat)
+            }
+            Text("CLI hidden until fans. No sparkle list, no serve, no Ollama 11434 in V1.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Done") { dismiss() }
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(20)
+        .frame(width: 400)
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = ChatModel()
     @FocusState private var focused: Bool
+    @State private var showSettings = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -330,10 +364,20 @@ struct ContentView: View {
                 Text("MLX 8081")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
             .background(Color(nsColor: .windowBackgroundColor))
+            .sheet(isPresented: $showSettings) {
+                SettingsView()
+                    .environmentObject(model)
+            }
             
             Divider()
             
@@ -343,26 +387,36 @@ struct ContentView: View {
                     LazyVStack(alignment: .leading, spacing: 12) {
                     if model.messages.isEmpty {
                         VStack(spacing: 16) {
-                            Image(systemName: "sparkles")
-                                .font(.system(size: 20))
-                                .foregroundStyle(.secondary)
-                            Text("Welcome to Sparkle")
-                                .font(.system(size: 15, weight: .semibold))
-                            Text("No models yet. Pick one, one click, no HF token.")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                            
-                            ForEach(OnboardingModel.all) { m in
-                                OnboardingCard(model: m).environmentObject(model)
+                            if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+                               let img = NSImage(contentsOf: url) {
+                                Image(nsImage: img)
+                                    .resizable()
+                                    .frame(width: 64, height: 64)
+                                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                                    .shadow(radius: 8)
+                            } else {
+                                Image(systemName: "sparkles")
+                                    .font(.system(size: 28))
+                                    .foregroundStyle(.primary)
                             }
-                            
-                            Text(" CLI: sparkle run gemma4:e4b  •  sparkle list  •  sparkle serve at :11234")
-                                .font(.system(size: 10, design: .monospaced))
+                            Text("Welcome to Sparkle")
+                                .font(.system(size: 18, weight: .semibold))
+                            Text("Own your AI. No cloud. No token.")
+                                .font(.system(size: 13))
                                 .foregroundStyle(.secondary)
-                                .padding(.top, 4)
+                            Button(action: { focused = true }) {
+                                Text("Start chatting")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .padding(.horizontal, 20)
+                                    .padding(.vertical, 8)
+                                    .background(Color.blue, in: Capsule())
+                                    .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.top, 8)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.top, 20)
+                        .padding(.top, 40)
                         .padding(.horizontal, 16)
                     }
                     ForEach(model.messages) { msg in

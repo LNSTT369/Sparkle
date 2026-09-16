@@ -1,55 +1,45 @@
-# Sparkle — Take Nothing MLX Chat for Apple Silicon
+<p align="center">
+  <img src="docs/hero.png" width="720" alt="Sparkle V1 hero">
+</p>
 
-Stripped fork of `ddalcu/mlx-serve`. One binary, one port, chat + image only. No Python, no bloat.
+<h1 align="center">Sparkle</h1>
 
-**V1 is opinionated:** Apple Silicon only, macOS 26.2+, 3 curated models. Everything else is cut.
+<p align="center">
+  <strong>Own your AI. No cloud. No token.</strong><br>
+  Chat, image, and vision on your Mac. Offline. One download.
+</p>
 
-## What we kept from mlx-serve
+<p align="center">
+  <a href="https://github.com/LNSTT369/Sparkle/releases/latest/download/Sparkle.dmg">
+    <img src="https://img.shields.io/badge/Download-Sparkle.dmg-blue?style=for-the-badge&logo=apple" alt="Download">
+  </a>
+  <br>
+  <sub>Apple Silicon · macOS 14+ · 5GB with gemma-4-e4b-it-4bit inside · No HF token</sub>
+</p>
 
-* **No Python at runtime, single Zig binary** — `build.zig` fetches Zig + mlx + llama.cpp, ~7MB. Strip frameworks.
-* **Homebrew Cask + DMG notarized** — `brew tap LNSTT369/Sparkle && brew install --cask sparkle` + GitHub Releases. One channel.
-* **One port, 3 APIs** — `http://localhost:11234` speaks OpenAI, Anthropic, Ollama `/api/chat`. Works with Claude Code, OpenCode, Pi, Open WebUI with no config. One wire.
-* **Resumable HF downloads** — finds existing LM Studio models, multi-connection. Break proof.
-* **Hidden speed** — continuous batching, KV-cache 4/8-bit, speculative decoding as defaults. No knobs.
+---
 
-## What we cut for Take Nothing
+### One download
 
-* No `containers/` — removed sandboxed Linux VM agent shell (`agent-shell-mlxserve`, `guest-kernel`)
-* No `website/` — docs site, keep `docs/` minimal
-* No 4 tap channels, no `containers` folder. One Cask only.
-* No LAN Bonjour sharing — local only.
-* No Responses WebSocket + openclaw/hermes launchers — one flag `--port 8080` is enough.
-* No exposed tuning knobs — only `temp` and `max_tokens`.
-* No full MLX Core scope — no MCP marketplace, no VM sandbox, no Telegram bridge, no Hey Loki hands-free, no folder RAG, no prompt skills. V1 is chat + image drop only.
+Drag `Sparkle.dmg` to `/Applications`, open, and chat. The 4.8GB `gemma-4-e4b-it-4bit` is already inside `Contents/Resources/models`, no cards, no `Download` wait.
 
-## Get started
+### What it does
 
-Needs macOS 26.2+ on Apple Silicon, Xcode + Metal Toolchain.
+* Chat at 79 tok/s, vision at 76 tok/s, image drop inline
+* Streaming typewriter, `/clear` to reset, `⌘,` for the other two models hidden in Settings
+* Menu bar star, dock star, `stream: true` on `http://127.0.0.1:11234` for Claude Code
 
-```bash
-git clone https://github.com/LNSTT369/Sparkle && cd Sparkle
-brew bundle install --file=Brewfile
-./app/build.sh
-# or CLI only
-zig build
-```
+### For the curious
 
 ```bash
-# chat, auto download + REPL, 3 curated models only
-./zig-out/bin/sparkle run gemma4:e4b --port 8080
-./zig-out/bin/sparkle run qwen3-coder:30b
-./zig-out/bin/sparkle pull gemma4
-./zig-out/bin/sparkle list
-./zig-out/bin/sparkle serve
+brew tap LNSTT369/Sparkle && brew install --cask sparkle
+sparkle run gemma4:e4b  # same 4.8GB, auto pulls if you use the Lite build
 ```
 
-Point any OpenAI or Anthropic client at `http://localhost:8080` with your `~/models/gemma-4-e4b-8bit-mlx`.
+MIT. Built in Swift + Zig, no Electron, no Python at runtime.
 
-## V1 Models — curated, not 3000
-
-* `gemma-4-e4b-8bit-mlx` 8.9GB — your current MLX, chat + vision, default
-* `gemma-4-e4b-it-4bit` 5GB — for 16GB Macs
-* `qwen3-coder:30b` 18GB — coding, same as Ollama `qwen3-coder:30b`
-
-Forked from https://github.com/ddalcu/mlx-serve — MIT. See `NOTICE` and original `CHANGELOG.md`.
-
+<p align="center">
+  <img src="docs/hero.png" width="360" alt="Chat with image">
+  <br>
+  <sub>Drop a photo, ask, get an answer. No cloud.</sub>
+</p>
