@@ -1,11 +1,14 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct Message: Identifiable {
+struct Message: Identifiable, Equatable {
     let id = UUID()
     let role: String // user or assistant
     var content: String
     var imageData: Data?
+    static func == (lhs: Message, rhs: Message) -> Bool {
+        lhs.id == rhs.id && lhs.role == rhs.role && lhs.content == rhs.content && lhs.imageData == rhs.imageData
+    }
 }
 
 @MainActor
@@ -491,7 +494,12 @@ struct ContentView: View {
                     Text("Chats")
                         .font(.system(size: 12, weight: .semibold))
                     Spacer()
-                    Button(action: { sessions.createNew(); model.messages.removeAll(); hasStarted = true }) {
+                    Button(action: {
+                        sessions.updateCurrent(with: model.messages)
+                        sessions.createNew()
+                        model.messages.removeAll()
+                        hasStarted = true
+                    }) {
                         Image(systemName: "plus")
                             .font(.system(size: 11))
                     }
@@ -553,9 +561,17 @@ struct ContentView: View {
             }
             
             Divider()
+            .onChange(of: sessions.selectedId) { _, newId in
+                if let id = newId, let s = sessions.sessions.first(where: { $0.id == id }) {
+                    model.messages = s.messages.map { Message(role: $0.role, content: $0.content) }
+                    hasStarted = !s.messages.isEmpty || hasStarted
+                }
+            }
+            .onChange(of: model.messages) { _, newMessages in
+                sessions.updateCurrent(with: newMessages)
+            }
             
             if !hasStarted {
-                // Page 1 - Welcome only, no text bar
                 VStack(spacing: 16) {
                     Spacer()
                     if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
@@ -711,6 +727,10 @@ struct ContentView: View {
         }
         .onAppear {
             focused = true
+            if let id = sessions.selectedId, let s = sessions.sessions.first(where: { $0.id == id }) {
+                model.messages = s.messages.map { Message(role: $0.role, content: $0.content, imageData: nil) }
+                hasStarted = !s.messages.isEmpty || hasStarted
+            }
             Task { await model.ensureServer() }
         }
     }
