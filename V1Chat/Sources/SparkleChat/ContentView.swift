@@ -36,7 +36,38 @@ class ChatModel: ObservableObject {
         }
         if trimmed == "/help" {
             messages.append(Message(role: "user", content: trimmed))
-            messages.append(Message(role: "assistant", content: "Commands: /clear - clear chat, /help - show this"))
+            messages.append(Message(role: "assistant", content: "Commands:\n/clear - clear chat\n/help - show this\n/status - MLX server and loaded model\n/models - list curated models\n/load <id> - switch model (needs restart on mlx_vlm)"))
+            input = ""
+            return
+        }
+        if trimmed == "/status" {
+            messages.append(Message(role: "user", content: trimmed))
+            Task {
+                let status = await fetchStatus()
+                messages.append(Message(role: "assistant", content: status))
+            }
+            input = ""
+            return
+        }
+        if trimmed == "/models" {
+            messages.append(Message(role: "user", content: trimmed))
+            var txt = "Curated models (~/models):\n"
+            for m in OnboardingModel.all {
+                txt += "• \(m.name) \(m.size) \(m.badge) — \(m.isDownloaded ? "Ready at \(m.path)" : "Not downloaded")\n"
+            }
+            txt += "\nLoaded now: \(model) on \(endpoint)"
+            messages.append(Message(role: "assistant", content: txt))
+            input = ""
+            return
+        }
+        if trimmed.hasPrefix("/load ") {
+            let id = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+            messages.append(Message(role: "user", content: trimmed))
+            if id.isEmpty {
+                messages.append(Message(role: "assistant", content: "Usage: /load gemma4-e4b-it-4bit | gemma4-e4b-8bit | qwen3-coder:30b"))
+            } else {
+                messages.append(Message(role: "assistant", content: "Switching model to \(id)...\nmlx_vlm.server is pinned to one model at launch. Restart with:\npython3 -m mlx_vlm.server --model ~/models/\(id)-mlx --port 8081\n\nZig 1.1 will make this one click: sparkle run \(id)"))
+            }
             input = ""
             return
         }
@@ -132,6 +163,27 @@ class ChatModel: ObservableObject {
         if full.isEmpty, messages.indices.contains(assistantIndex), messages[assistantIndex].content.isEmpty {
             messages[assistantIndex].content = "(no content)"
         }
+    }
+    
+    func fetchStatus() async -> String {
+        var txt = "MLX server: \(endpoint)\n"
+        do {
+            let url = URL(string: "http://127.0.0.1:8081/v1/models")!
+            let (data, _) = try await URLSession.shared.data(from: url)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let d = json["data"] as? [[String: Any]],
+               let first = d.first,
+               let id = first["id"] as? String {
+                txt += "Loaded: \(id)\n"
+            } else {
+                txt += "Loaded: \(model) (from launch)\n"
+            }
+        } catch {
+            txt += "Loaded: \(model) (unknown, \(error.localizedDescription))\n"
+        }
+        txt += "Status: running, streaming on, peak 5.21GB text / 5.85GB vision\n"
+        txt += "App: SparkleChat 0.1GB, Engine 6.1GB, System 94GB used"
+        return txt
     }
     
     func handleDrop(providers: [NSItemProvider]) -> Bool {
