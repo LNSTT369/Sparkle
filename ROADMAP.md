@@ -10,15 +10,12 @@
 
 ## V1.1 — One Click — Zig Single Binary
 *Status: Building in background, pid from /tmp/build-mlx.log, MLX 26.0 patched for M2 Max, ~10 min*
-- Goal: `brew tap LNSTT369/Sparkle && brew install --cask sparkle` or DMG from https://github.com/LNSTT369/Sparkle/releases, no pip, no python
+- Goal: Single `Sparkle.dmg` 3.9GB at `~/Desktop/Sparkle/releases/Sparkle.dmg` with `gemma-4-e4b-it-4bit-mlx` 4.8GB inside `Contents/Resources/models`, no Lite, one download and chat offline
+- Also `brew tap LNSTT369/Sparkle && brew install --cask sparkle` installs the same bundle, no pip, no python
 - Single Zig binary ~7MB at `~/Desktop/Sparkle/zig-out/bin/sparkle`, no Python at runtime
 - One port `http://localhost:11234` with OpenAI, Anthropic, Ollama on one wire, like Ollama
 - CLI habit: `sparkle run gemma4:e4b` auto pulls if missing then chats, `sparkle list`, `sparkle serve` at 11234 for Claude Code and Open WebUI
-- Onboarding for 0 models: First open shows empty state with 3 curated cards, not chat
-  - `gemma-4-e4b-it-4bit` 4.8GB — Recommended for 16GB, 74 tok/s, vision
-  - `gemma-4-e4b-8bit` 8.9GB — Your 96GB, 81 tok/s
-  - `qwen3-coder:30b` 18GB — Coding, like your Ollama `qwen3-coder:30b`
-  - Each card: `Download • 4.8GB • 2 min on WiFi` with progress bar, resumable multi-connection like `mlx-serve pull` already does, one click, no HF token needed Apache-2
+- Onboarding: Bundled first open shows `4.8GB` as `Ready`, extras `8.9GB` and `18GB` as `Download` cards
 - Hidden speed: continuous batching, KV 4/8 bit, speculative decoding as defaults, no knobs
 
 ## V1.2 — Browser Single Tab
