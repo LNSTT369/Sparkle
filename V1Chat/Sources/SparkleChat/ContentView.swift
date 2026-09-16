@@ -20,6 +20,10 @@ class ChatModel: ObservableObject {
     @Published var selectedImageData: Data?
     @Published var streamTick = 0
     private var serverProcess: Process?
+    // Settings from Osaurus generationSection
+    var temperature: Double { UserDefaults.standard.object(forKey: "modelTemperature") as? Double ?? 0.7 }
+    var topP: Double { UserDefaults.standard.object(forKey: "modelTopP") as? Double ?? 1.0 }
+    var contextLength: Int { UserDefaults.standard.object(forKey: "modelContextLength") as? Double ?? 8192 > 0 ? Int(UserDefaults.standard.object(forKey: "modelContextLength") as? Double ?? 8192) : 8192 }
     
     // Opinionated: smallest model, one port, no knobs - streaming
     // V1.1 Zig at 11234, fallback to Python 8081
@@ -146,11 +150,19 @@ class ChatModel: ObservableObject {
             }
         }
         
+        // Truncate to contextLength like Osaurus: keep last messages that fit
+        let ctx = contextLength
+        // Rough truncate: keep last 20 messages if payload too large (approx 400 tokens each)
+        var payloadForSend = messagesPayload
+        if payloadForSend.count > 20 {
+            payloadForSend = Array(payloadForSend.suffix(20))
+        }
         let body: [String: Any] = [
             "model": model,
-            "messages": messagesPayload,
-            "max_tokens": 512,
-            "temperature": 0.7,
+            "messages": payloadForSend,
+            "max_tokens": min(512, ctx / 4),
+            "temperature": temperature,
+            "top_p": topP,
             "stream": true
         ]
         
@@ -398,13 +410,52 @@ struct OnboardingCard: View {
 struct SettingsView: View {
     @EnvironmentObject var chat: ChatModel
     @Environment(\.dismiss) var dismiss
+    @AppStorage("modelTemperature") private var temperature: Double = 0.7
+    @AppStorage("modelContextLength") private var contextLength: Double = 8192
+    @AppStorage("modelTopP") private var topP: Double = 1.0
     var body: some View {
         VStack(spacing: 16) {
             Text("Settings")
                 .font(.system(size: 14, weight: .semibold))
+            // Models - moved from empty state, now in Settings per Jobs Take
             ForEach(OnboardingModel.all) { m in
                 OnboardingCard(model: m).environmentObject(chat)
             }
+            Divider()
+            // Generation - learn from Osaurus ChatSettingsView generationSection
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Generation")
+                    .font(.system(size: 12, weight: .semibold))
+                HStack {
+                    Text("Temperature")
+                        .font(.system(size: 11))
+                    Slider(value: $temperature, in: 0...2, step: 0.1)
+                    Text(String(format: "%.1f", temperature))
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 28)
+                }
+                HStack {
+                    Text("Context")
+                        .font(.system(size: 11))
+                    Slider(value: $contextLength, in: 2048...131072, step: 2048)
+                    Text("\(Int(contextLength))")
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 50)
+                }
+                HStack {
+                    Text("Top-P")
+                        .font(.system(size: 11))
+                    Slider(value: $topP, in: 0...1, step: 0.05)
+                    Text(String(format: "%.2f", topP))
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(width: 28)
+                }
+                Text("Temp 0.7 is balanced, 0 is greedy, 2 is creative. Context is window for continuous memory, 8192 is default, 131072 is max for gemma-4-e4b.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             Text("CLI hidden until fans. No sparkle list, no serve, no Ollama 11434 in V1.")
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
@@ -413,7 +464,7 @@ struct SettingsView: View {
                 .buttonStyle(.borderedProminent)
         }
         .padding(20)
-        .frame(width: 400)
+        .frame(width: 420)
     }
 }
 
