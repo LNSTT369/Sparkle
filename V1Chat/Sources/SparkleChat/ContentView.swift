@@ -142,8 +142,9 @@ struct ContentView: View {
             Divider()
             
             // Messages
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
                     if model.messages.isEmpty {
                         VStack(spacing: 8) {
                             Image(systemName: "sparkles")
@@ -194,11 +195,19 @@ struct ContentView: View {
                         }
                         .padding(.horizontal, 16)
                     }
+                    Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.vertical, 12)
             }
             .background(Color(nsColor: .textBackgroundColor))
             .onDrop(of: [UTType.image], isTargeted: nil, perform: model.handleDrop)
+            .onChange(of: model.messages.count) { _, _ in
+                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: model.isLoading) { _, _ in
+                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            }
             
             Divider()
             
