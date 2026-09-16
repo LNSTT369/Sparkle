@@ -402,6 +402,7 @@ struct ContentView: View {
     @StateObject private var model = ChatModel()
     @FocusState private var focused: Bool
     @State private var showSettings = false
+    @State private var hasStarted = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -419,7 +420,7 @@ struct ContentView: View {
                 Circle()
                     .fill(Color.green)
                     .frame(width: 8, height: 8)
-                Text("MLX 8081")
+                Text(hasStarted ? "MLX 8081" : "Ready")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                 Button(action: { showSettings = true }) {
@@ -438,6 +439,46 @@ struct ContentView: View {
             }
             
             Divider()
+            
+            if !hasStarted {
+                // Page 1 - Welcome only, no text bar
+                VStack(spacing: 16) {
+                    Spacer()
+                    if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+                       let img = NSImage(contentsOf: url) {
+                        Image(nsImage: img)
+                            .resizable()
+                            .frame(width: 64, height: 64)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                            .shadow(radius: 8)
+                    } else {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 28))
+                            .foregroundStyle(.primary)
+                    }
+                    Text("Welcome to Sparkle")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text("Own your AI. No cloud. No token.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                    Button(action: {
+                        hasStarted = true
+                        Task { await model.ensureServer(); focused = true }
+                    }) {
+                        Text("Start chatting")
+                            .font(.system(size: 13, weight: .medium))
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 8)
+                            .background(Color.blue, in: Capsule())
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 8)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(nsColor: .textBackgroundColor))
+            } else {
             
             // Messages
             ScrollViewReader { proxy in
@@ -575,6 +616,7 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(Color(nsColor: .windowBackgroundColor))
+            }
         }
         .onAppear {
             focused = true
