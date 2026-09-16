@@ -15,8 +15,9 @@ class ChatModel: ObservableObject {
     @Published var isLoading = false
     @Published var selectedImage: NSImage?
     @Published var selectedImageData: Data?
+    @Published var streamTick = 0
     
-    // Opinionated: smallest model, one port, no knobs
+    // Opinionated: smallest model, one port, no knobs - streaming
     let endpoint = "http://127.0.0.1:8081/v1/chat/completions"
     let model = "/Users/user/models/gemma-4-e4b-it-4bit-mlx"
     
@@ -25,7 +26,7 @@ class ChatModel: ObservableObject {
         guard !trimmed.isEmpty || selectedImageData != nil else { return }
         guard !isLoading else { return }
         
-        var userContent: String = trimmed
+        let userContent: String = trimmed
         let imageData = selectedImageData
         
         let userMsg = Message(role: "user", content: trimmed.isEmpty ? "[image]" : trimmed, imageData: imageData)
@@ -35,21 +36,25 @@ class ChatModel: ObservableObject {
         selectedImageData = nil
         isLoading = true
         
+        // Create empty assistant message that will be streamed into
+        var assistantMsg = Message(role: "assistant", content: "")
+        messages.append(assistantMsg)
+        let assistantIndex = messages.count - 1
+        
         Task {
             do {
-                let reply = try await callMLX(prompt: userContent, imageData: imageData)
-                messages.append(Message(role: "assistant", content: reply))
+                try await streamMLX(prompt: userContent, imageData: imageData, assistantIndex: assistantIndex)
             } catch {
-                messages.append(Message(role: "assistant", content: "Error: \(error.localizedDescription)"))
+                if messages.indices.contains(assistantIndex) {
+                    messages[assistantIndex].content = "Error: \(error.localizedDescription)"
+                }
             }
             isLoading = false
         }
     }
     
-    func callMLX(prompt: String, imageData: Data?) async throws -> String {
+    func streamMLX(prompt: String, imageData: Data?, assistantIndex: Int) async throws {
         var messagesPayload: [[String: Any]] = []
-        
-        // Build content array
         if let data = imageData {
             let b64 = data.base64EncodedString()
             let mime = "image/jpeg"
@@ -67,32 +72,51 @@ class ChatModel: ObservableObject {
             "messages": messagesPayload,
             "max_tokens": 512,
             "temperature": 0.7,
-            "stream": false
+            "stream": true
         ]
         
         let data = try JSONSerialization.data(withJSONObject: body)
         var req = URLRequest(url: URL(string: endpoint)!)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         req.httpBody = data
         req.timeoutInterval = 120
         
-        let (resData, response) = try await URLSession.shared.data(for: req)
+        let (bytes, response) = try await URLSession.shared.bytes(for: req)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            let txt = String(data: resData, encoding: .utf8) ?? "unknown"
-            throw NSError(domain: "MLX", code: 1, userInfo: [NSLocalizedDescriptionKey: "HTTP error: \(txt.prefix(300))"])
+            throw NSError(domain: "MLX", code: 1, userInfo: [NSLocalizedDescriptionKey: "HTTP \(String(describing: (response as? HTTPURLResponse)?.statusCode))"])
         }
-        let json = try JSONSerialization.jsonObject(with: resData) as? [String: Any]
-        if let choices = json?["choices"] as? [[String: Any]],
-           let first = choices.first,
-           let msg = first["message"] as? [String: Any],
-           let content = msg["content"] as? String {
-            return content
+        
+        var full = ""
+        for try await line in bytes.lines {
+            // Each line is like: data: {"choices":[{"delta":{"content":" Hello"}}]}
+            guard line.hasPrefix("data: ") else { continue }
+            let payload = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" { break }
+            guard let d = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let first = choices.first else { continue }
+            // delta.content for stream, or message.content as fallback
+            var deltaText: String?
+            if let delta = first["delta"] as? [String: Any] {
+                deltaText = delta["content"] as? String
+            } else if let msg = first["message"] as? [String: Any] {
+                deltaText = msg["content"] as? String
+            }
+            if let t = deltaText, !t.isEmpty {
+                full += t
+                if messages.indices.contains(assistantIndex) {
+                    messages[assistantIndex].content = full
+                    streamTick += 1
+                }
+            }
         }
-        if let err = String(data: resData, encoding: .utf8) {
-            return err
+        // Ensure final content set
+        if full.isEmpty, messages.indices.contains(assistantIndex), messages[assistantIndex].content.isEmpty {
+            messages[assistantIndex].content = "(no content)"
         }
-        return "No content"
     }
     
     func handleDrop(providers: [NSItemProvider]) -> Bool {
@@ -206,6 +230,9 @@ struct ContentView: View {
             }
             .onChange(of: model.isLoading) { _, _ in
                 withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: model.streamTick) { _, _ in
+                proxy.scrollTo("bottom", anchor: .bottom)
             }
             }
             
