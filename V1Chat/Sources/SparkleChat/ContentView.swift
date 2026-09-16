@@ -114,17 +114,33 @@ class ChatModel: ObservableObject {
     }
     
     func streamMLX(prompt: String, imageData: Data?, assistantIndex: Int) async throws {
+        // Continuous memory: send full history up to assistantIndex
         var messagesPayload: [[String: Any]] = []
-        if let data = imageData {
-            let b64 = data.base64EncodedString()
-            let mime = "image/jpeg"
-            let contentArray: [[String: Any]] = [
-                ["type": "text", "text": prompt.isEmpty ? "Describe this image" : prompt],
-                ["type": "image_url", "image_url": ["url": "data:\(mime);base64,\(b64)"]]
-            ]
-            messagesPayload.append(["role": "user", "content": contentArray])
-        } else {
-            messagesPayload.append(["role": "user", "content": prompt])
+        for idx in 0..<assistantIndex {
+            let msg = messages[idx]
+            if msg.role == "user", let data = msg.imageData {
+                let b64 = data.base64EncodedString()
+                let contentArray: [[String: Any]] = [
+                    ["type": "text", "text": msg.content.isEmpty ? "Describe this image" : msg.content],
+                    ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)"]]
+                ]
+                messagesPayload.append(["role": "user", "content": contentArray])
+            } else {
+                messagesPayload.append(["role": msg.role, "content": msg.content])
+            }
+        }
+        // Fallback if history empty (should not happen as userMsg already appended)
+        if messagesPayload.isEmpty {
+            if let data = imageData {
+                let b64 = data.base64EncodedString()
+                let contentArray: [[String: Any]] = [
+                    ["type": "text", "text": prompt.isEmpty ? "Describe this image" : prompt],
+                    ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)"]]
+                ]
+                messagesPayload.append(["role": "user", "content": contentArray])
+            } else {
+                messagesPayload.append(["role": "user", "content": prompt])
+            }
         }
         
         let body: [String: Any] = [
@@ -402,7 +418,7 @@ struct ContentView: View {
     @StateObject private var model = ChatModel()
     @FocusState private var focused: Bool
     @State private var showSettings = false
-    @State private var hasStarted = false
+    @AppStorage("hasStarted") private var hasStarted = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -480,45 +496,21 @@ struct ContentView: View {
                 .background(Color(nsColor: .textBackgroundColor))
             } else {
             
-            // Messages
+            // Messages - no second welcome, just chat
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                     if model.messages.isEmpty {
-                        VStack(spacing: 16) {
-                            if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
-                               let img = NSImage(contentsOf: url) {
-                                Image(nsImage: img)
-                                    .resizable()
-                                    .frame(width: 64, height: 64)
-                                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                                    .shadow(radius: 8)
-                            } else {
-                                Image(systemName: "sparkles")
-                                    .font(.system(size: 28))
-                                    .foregroundStyle(.primary)
-                            }
-                            Text("Welcome to Sparkle")
-                                .font(.system(size: 18, weight: .semibold))
-                            Text("Own your AI. No cloud. No token.")
+                        VStack(spacing: 8) {
+                            Text("Start a conversation")
                                 .font(.system(size: 13))
                                 .foregroundStyle(.secondary)
-                            Button(action: {
-                                Task { await model.ensureServer(); focused = true }
-                            }) {
-                                Text("Start chatting")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .padding(.horizontal, 20)
-                                    .padding(.vertical, 8)
-                                    .background(Color.blue, in: Capsule())
-                                    .foregroundStyle(.white)
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.top, 8)
+                            Text("Ask anything, drop an image")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.top, 40)
-                        .padding(.horizontal, 16)
                     }
                     ForEach(model.messages) { msg in
                         HStack(alignment: .top, spacing: 10) {
