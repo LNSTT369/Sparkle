@@ -414,13 +414,111 @@ struct SettingsView: View {
     }
 }
 
+struct ChatSession: Identifiable, Codable, Equatable {
+    var id: UUID = UUID()
+    var title: String
+    var updatedAt: Date
+    var messages: [MessageCodable]
+}
+
+struct MessageCodable: Codable, Equatable {
+    var role: String
+    var content: String
+}
+
+class SessionsManager: ObservableObject {
+    @Published var sessions: [ChatSession] = []
+    @Published var selectedId: UUID?
+    
+    private var savePath: URL {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Sparkle")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("sessions.json")
+    }
+    
+    init() {
+        load()
+        if sessions.isEmpty {
+            let s = ChatSession(title: "New Chat", updatedAt: Date(), messages: [])
+            sessions = [s]
+            selectedId = s.id
+            save()
+        } else if selectedId == nil {
+            selectedId = sessions.first?.id
+        }
+    }
+    
+    func load() {
+        guard let data = try? Data(contentsOf: savePath),
+              let decoded = try? JSONDecoder().decode([ChatSession].self, from: data) else { return }
+        sessions = decoded.sorted { $0.updatedAt > $1.updatedAt }
+    }
+    
+    func save() {
+        try? JSONEncoder().encode(sessions).write(to: savePath)
+    }
+    
+    func createNew() {
+        let s = ChatSession(title: "New Chat", updatedAt: Date(), messages: [])
+        sessions.insert(s, at: 0)
+        selectedId = s.id
+        save()
+    }
+    
+    func updateCurrent(with messages: [Message]) {
+        guard let id = selectedId, let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
+        let title = messages.first(where: { $0.role == "user" })?.content.prefix(30).description ?? "New Chat"
+        sessions[idx].title = String(title)
+        sessions[idx].updatedAt = Date()
+        sessions[idx].messages = messages.map { MessageCodable(role: $0.role, content: $0.content) }
+        sessions.sort { $0.updatedAt > $1.updatedAt }
+        save()
+    }
+}
+
 struct ContentView: View {
     @StateObject private var model = ChatModel()
+    @StateObject private var sessions = SessionsManager()
     @FocusState private var focused: Bool
     @State private var showSettings = false
     @AppStorage("hasStarted") private var hasStarted = false
     
     var body: some View {
+        NavigationSplitView {
+            // Sidebar - sessions sorted by updatedAt like Osaurus ChatSessionsManager
+            VStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("Chats")
+                        .font(.system(size: 12, weight: .semibold))
+                    Spacer()
+                    Button(action: { sessions.createNew(); model.messages.removeAll(); hasStarted = true }) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut("n", modifiers: .command)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                List(selection: $sessions.selectedId) {
+                    ForEach(sessions.sessions) { s in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(s.title.isEmpty ? "New Chat" : s.title)
+                                .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                            Text(s.updatedAt, style: .date)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                        .tag(s.id)
+                    }
+                }
+                .listStyle(.sidebar)
+            }
+            .frame(minWidth: 180)
+            .toolbar(removing: .sidebarToggle)
+        } detail: {
         VStack(spacing: 0) {
             // Header - Take Nothing: no settings, just model name
             HStack {
@@ -608,6 +706,7 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(Color(nsColor: .windowBackgroundColor))
+            }
             }
         }
         .onAppear {
