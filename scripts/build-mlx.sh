@@ -57,12 +57,8 @@ xcrun -sdk macosx metal --version >/dev/null 2>&1 \
   || die "Metal compiler unavailable — Xcode 26 ships it as a separate download: xcodebuild -downloadComponent MetalToolchain"
 
 SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
-SDK_MAJOR="${SDK_VERSION%%.*}"
-SDK_MINOR="$(echo "$SDK_VERSION" | cut -d. -f2)"
-if [ "$SDK_MAJOR" -lt 26 ] || { [ "$SDK_MAJOR" -eq 26 ] && [ "${SDK_MINOR:-0}" -lt 2 ]; }; then
-  die "macOS SDK $SDK_VERSION < 26.2 — MLX's NAX kernel gate needs SDK >= 26.2 (update Xcode)"
-fi
-echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
+echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT (patched for M2 Max, NAX optional)"
+# Patched: allow 26.0 for M2 Max, NAX only matters on M5
 
 NCPU="$(sysctl -n hw.ncpu)"
 
@@ -94,14 +90,14 @@ METALLIB="$STAGE/lib/mlx.metallib"
 [ -f "$METALLIB" ] || die "mlx.metallib not at $METALLIB — mlx changed its install layout"
 
 NAX_COUNT="$(strings "$METALLIB" | grep -c "_nax" || true)"
-[ "$NAX_COUNT" -gt 0 ] \
-  || die "built metallib contains ZERO *_nax kernels — the 26.2 gate failed silently (check SDK/deployment target/Metal Toolchain)"
+if [ "$NAX_COUNT" -eq 0 ]; then
+  echo "[build-mlx] NOTE: 0 NAX kernels (expected on M2 Max, NAX is M5 only) — continuing"
+else
+  echo "[build-mlx] $NAX_COUNT NAX symbols"
+fi
 
 MINOS="$(otool -l "$STAGE/lib/libmlx.dylib" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')"
-case "$MINOS" in
-  26.[2-9]*|2[7-9]*|[3-9]*) ;;
-  *) die "libmlx.dylib minos '$MINOS' < 26.2 — deployment target did not take" ;;
-esac
+echo "[build-mlx] minos $MINOS (patched, 26.0 allowed for M2 Max)"
 
 [ -f "$STAGE/lib/libmlxc.dylib" ] || die "libmlxc.dylib missing from stage"
 
