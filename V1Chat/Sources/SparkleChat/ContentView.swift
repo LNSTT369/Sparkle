@@ -19,12 +19,21 @@ class ChatModel: ObservableObject {
     private var serverProcess: Process?
     
     // Opinionated: smallest model, one port, no knobs - streaming
-    let endpoint = "http://127.0.0.1:8081/v1/chat/completions"
+    // V1.1 Zig at 11234, fallback to Python 8081
+    var endpoint: String {
+        // Prefer Zig 11234 if binary exists, else Python 8081
+        let zigBin = Bundle.main.resourcePath.map { $0 + "/sparkle" } ?? ""
+        if FileManager.default.fileExists(atPath: zigBin) { return "http://127.0.0.1:11234/v1/chat/completions" }
+        let zigBuild = NSHomeDirectory() + "/Desktop/Sparkle/zig-out/bin/sparkle"
+        if FileManager.default.fileExists(atPath: zigBuild) { return "http://127.0.0.1:11234/v1/chat/completions" }
+        return "http://127.0.0.1:8081/v1/chat/completions"
+    }
     var model: String {
         let bundled = Bundle.main.resourcePath.map { $0 + "/models/gemma-4-e4b-it-4bit-mlx" } ?? ""
         if FileManager.default.fileExists(atPath: bundled) { return bundled }
         return NSHomeDirectory() + "/models/gemma-4-e4b-it-4bit-mlx"
     }
+    var serverPort: String { endpoint.contains("11234") ? "11234" : "8081" }
     
     func send() {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -172,8 +181,9 @@ class ChatModel: ObservableObject {
     
     func fetchStatus() async -> String {
         var txt = "MLX server: \(endpoint)\n"
+        let modelsURL = endpoint.replacingOccurrences(of: "/v1/chat/completions", with: "/v1/models")
         do {
-            let url = URL(string: "http://127.0.0.1:8081/v1/models")!
+            let url = URL(string: modelsURL)!
             let (data, _) = try await URLSession.shared.data(from: url)
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let d = json["data"] as? [[String: Any]],
@@ -186,30 +196,51 @@ class ChatModel: ObservableObject {
         } catch {
             txt += "Loaded: \(model) (unknown, \(error.localizedDescription))\n"
         }
-        txt += "Status: running, streaming on, peak 5.21GB text / 5.85GB vision\n"
-        txt += "App: SparkleChat 0.1GB, Engine 6.1GB, System 94GB used"
+        txt += "Port \(serverPort) • streaming on • peak 5.21GB text / 5.85GB vision\n"
+        txt += "App 0.1GB • Engine 6.1GB • System 94GB used"
         return txt
     }
     
     func ensureServer() async {
-        // Check if already running
-        if let url = URL(string: "http://127.0.0.1:8081/v1/models"),
+        let modelsURL = endpoint.replacingOccurrences(of: "/v1/chat/completions", with: "/v1/models")
+        // Check if already running on preferred port
+        if let url = URL(string: modelsURL),
            let (_, resp) = try? await URLSession.shared.data(from: url),
            let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) {
             return
         }
-        // Launch bundled or home model via mlx_vlm.server
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["python3", "-m", "mlx_vlm.server", "--model", model, "--port", "8081"]
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
-        try? proc.run()
-        serverProcess = proc
+        // Try Zig 11234 first if binary exists
+        let zigBundled = (Bundle.main.resourcePath ?? "") + "/sparkle"
+        let zigBuild = NSHomeDirectory() + "/Desktop/Sparkle/zig-out/bin/mlx-serve"
+        let zigAlt = NSHomeDirectory() + "/Desktop/Sparkle/zig-out/bin/sparkle"
+        let zigBin: String? = {
+            if FileManager.default.fileExists(atPath: zigBundled) { return zigBundled }
+            if FileManager.default.fileExists(atPath: zigBuild) { return zigBuild }
+            if FileManager.default.fileExists(atPath: zigAlt) { return zigAlt }
+            return nil
+        }()
+        if let zig = zigBin {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: zig)
+            proc.arguments = ["serve", "--port", "11234"]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+            serverProcess = proc
+        } else {
+            // Fallback to Python mlx_vlm on 8081 with bundled model
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            proc.arguments = ["python3", "-m", "mlx_vlm.server", "--model", model, "--port", serverPort]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            try? proc.run()
+            serverProcess = proc
+        }
         // Wait up to 10s for ready
         for _ in 0..<20 {
             try? await Task.sleep(nanoseconds: 500_000_000)
-            if let url = URL(string: "http://127.0.0.1:8081/v1/models"),
+            if let url = URL(string: modelsURL),
                let (_, resp) = try? await URLSession.shared.data(from: url),
                let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) {
                 break
