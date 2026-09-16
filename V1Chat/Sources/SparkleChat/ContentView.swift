@@ -26,6 +26,21 @@ class ChatModel: ObservableObject {
         guard !trimmed.isEmpty || selectedImageData != nil else { return }
         guard !isLoading else { return }
         
+        // Slash commands - Take Nothing: no buttons, just text
+        if trimmed == "/clear" {
+            messages.removeAll()
+            input = ""
+            selectedImage = nil
+            selectedImageData = nil
+            return
+        }
+        if trimmed == "/help" {
+            messages.append(Message(role: "user", content: trimmed))
+            messages.append(Message(role: "assistant", content: "Commands: /clear - clear chat, /help - show this"))
+            input = ""
+            return
+        }
+        
         let userContent: String = trimmed
         let imageData = selectedImageData
         
@@ -260,7 +275,7 @@ struct ContentView: View {
             
             // Input
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Ask or drop image, press Return", text: $model.input, axis: .vertical)
+                TextField("Ask, drop image, or /clear", text: $model.input, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .lineLimit(1...4)
@@ -284,11 +299,5 @@ struct ContentView: View {
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .onAppear { focused = true }
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button("Clear") { model.messages.removeAll() }
-                    .font(.system(size: 11))
-            }
-        }
     }
 }
