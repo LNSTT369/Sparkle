@@ -1,0 +1,544 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # PR builds run the FULL packaging pipeline — sign, notarize, DMG — and
+  # upload the result as a workflow artifact. They never tag and never create
+  # a GitHub release (step gates below). The Homebrew formula push lives in
+  # homebrew.yml, fired when a release is published. Fork PRs skip the whole
+  # job (no access to signing secrets — job-level `if`).
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + test + package only — skip tag, notarize, and release. Use to verify the workflow on a branch before cutting a real release."
+        type: boolean
+        default: false
+      pre_release:
+        description: "Cut this as a pre-release: tag v<YY.M.N>-pre-release.<n> instead of v<YY.M.N>"
+        type: boolean
+        default: false
+
+# A PR force-push mid-notarization should cancel the stale run; release runs
+# (tag push / dispatch) are never cancelled.
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    # Fork PRs have no signing/notarization secrets — skip cleanly instead of
+    # dying at the certificate import.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # macos-26 (Tahoe) so the Swift app links against the macOS 26 SDK. SwiftUI's
+    # MenuBarExtra(.window) popover only gets the correct Tahoe resize/height
+    # behavior when linked on-or-after the 26 SDK; building on macos-14 produced a
+    # menu-bar tray that wouldn't expand/collapse or retain height on Tahoe.
+    # Deployment target stays macOS 14 (Package.swift + Info.plist), so the app
+    # still runs on macOS 14+ — only the linked SDK changes.
+    runs-on: macos-26
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode (Swift 6.1+ required by MCP swift-sdk)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Zig
+        run: |
+          bash scripts/fetch-zig.sh
+          echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: brew bundle install --file=Brewfile
+
+      # mlx + mlx-c are pinned submodules built from source with deployment
+      # target 26.2 so MLX's NAX (M5 neural-accelerator) kernels are compiled
+      # in — the Homebrew bottle is built at 26.0 and ships with them silently
+      # disabled (MLX_METAL_NO_NAX). scripts/build-mlx.sh asserts the built
+      # metallib actually contains *_nax kernels. Compiling needs no M5: the
+      # runtime probe (GPU gen >= 17) gates dispatch on user machines.
+      - name: Compute mlx pin cache key
+        id: mlxpin
+        run: |
+          echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "mlxc=$(git -C lib/mlxc-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache self-built mlx + mlx-c
+        uses: actions/cache@v4
+        with:
+          path: lib/mlx
+          key: mlx-stage-${{ steps.mlxpin.outputs.mlx }}-${{ steps.mlxpin.outputs.mlxc }}-${{ steps.mlxpin.outputs.xcode }}
+
+      - name: Build mlx + mlx-c (NAX-enabled)
+        run: |
+          # Xcode 26 ships the Metal compiler as a separate component; fetch it
+          # if the image doesn't have it (build-mlx.sh hard-fails without it).
+          xcrun -sdk macosx metal --version >/dev/null 2>&1 \
+            || sudo xcodebuild -downloadComponent MetalToolchain
+          bash scripts/build-mlx.sh
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Extract version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # CalVer's YY.M comes from ONE pinned zone, matching app/build.sh —
+          # cutting v26.8.1 is what forced this. The dispatch ran 01:26 UTC on
+          # Aug 1 while it was still Jul 31 locally, so CI minted 26.8.1 against
+          # a CHANGELOG, Info.plist and perf artifacts that all said 26.7.12.
+          # Runners are UTC; without the pin the two clocks disagree for a few
+          # hours around every month boundary. Guarded by
+          # tests/test_release_workflow_gates.sh.
+          TZ: America/New_York
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # CalVer YY.M.N — N auto-increments from the last vYY.M.* release tag.
+            PREFIX="$(date +%y.%-m)"
+            LAST_N=$(gh release list --limit 100 --json tagName \
+              --jq "[.[] | .tagName | select(test(\"^v${PREFIX}\\\\.[0-9]+$\")) | sub(\"^v${PREFIX}\\\\.\"; \"\") | tonumber] | max // 0")
+            N=$((LAST_N + 1))
+            VERSION="${PREFIX}.${N}"
+            # A pre-release does NOT consume the version number: it tags
+            # v<VERSION>-pre-release.<P>, which the `^vYY.M.[0-9]+$` match above
+            # ignores, so the next run still mints the same N for the real
+            # release. P counts the pre-releases of THIS version from 1, read
+            # off the existing tags the same way N is, so a sequence reads
+            # v26.8.10-pre-release.1, .2, .3 and then v26.8.10. Every
+            # pre-release is numbered, including the first — an unnumbered one
+            # sorts ambiguously against .2 and reads like a different kind of
+            # thing rather than the first of a series.
+            if [ "${{ inputs.pre_release }}" = "true" ]; then
+              LAST_P=$(git ls-remote --tags origin "v${VERSION}-pre-release.*" \
+                | sed -n "s#.*refs/tags/v${VERSION}-pre-release\\.\\([0-9][0-9]*\\)\$#\\1#p" \
+                | sort -n | tail -1)
+              VERSION="${VERSION}-pre-release.$(( ${LAST_P:-0} + 1 ))"
+            fi
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR package: CalVer prefix + PR number + commit — never tagged,
+            # never released; only names the artifact and --version output.
+            PREFIX="$(date +%y.%-m)"
+            VERSION="${PREFIX}.0-pr${{ github.event.pull_request.number }}.$(git rev-parse --short HEAD)"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+        run: |
+          git tag v${{ steps.version.outputs.version }}
+          git push origin v${{ steps.version.outputs.version }}
+
+      - name: Fetch libllama (llama.cpp GGUF engine)
+        run: bash scripts/fetch-llama.sh
+
+      - name: Build mlx-serve (Zig)
+        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}
+
+      # The Agent Sandbox's guest-side binary (static aarch64-linux ELF). It
+      # rides inside the .app at Resources/guest/vz-agent — without it the
+      # guest boots the legacy console shell and sandboxed MCP can never
+      # connect (issue #89: the release bundle shipped without it).
+      - name: Build vz-agent guest binary
+        run: zig build vz-agent
+
+      - name: Smoke test mlx-serve binary
+        run: |
+          ./zig-out/bin/mlx-serve --version
+          ./zig-out/bin/mlx-serve --help > /dev/null
+
+      # Static guard: the staged metallib contains the *_nax kernels, minos
+      # >= 26.2, and the built binary links no leftover brew mlx/mlx-c. ci.yml
+      # runs the same check, but a cache-miss rebuild on THIS runner is the
+      # stage that actually ships in the DMG — guard it here too (mirrors the
+      # brew-bottle silent-fallback class in docs/gotchas/engine-mlx.md).
+      - name: Verify staged mlx (NAX kernels + minos)
+        run: bash tests/test_mlx_staged_nax.sh
+
+      - name: Run Zig tests
+        # PR commits already run the identical suite in ci.yml — don't pay for
+        # it twice; releases keep the belt-and-braces run.
+        if: github.event_name != 'pull_request'
+        run: zig build test --summary all
+
+      - name: Build Swift app
+        working-directory: app
+        # Package manifests own their language modes. A global Swift 5 override
+        # would also reach SwaTex, whose source correctly requires Swift 6.1.
+        run: |
+          # SwaTexRender's generated `Bundle.module` looks for its KaTeX fonts
+          # beside the .app, a spot codesign refuses to seal, so it never finds
+          # them in a hand-assembled bundle and traps on the first equation
+          # (issue #233). Mirrors app/build.sh.
+          swift package resolve
+          bash ../scripts/patch-swatex-font-lookup.sh .build/checkouts/SwaTex
+          swift build -c release
+          echo "SWIFT_BIN_PATH=$(swift build -c release --show-bin-path)" >> "$GITHUB_ENV"
+
+      - name: Run Swift tests
+        # Same rationale as the Zig tests — ci.yml covers the PR commit.
+        if: github.event_name != 'pull_request'
+        working-directory: app
+        run: swift test
+
+      # ── CLI tarball (standalone binary + libs) ──
+      - name: Package CLI binary
+        env:
+          SIGNING_IDENTITY: "Developer ID Application: David Dalcu (${{ secrets.APPLE_TEAM_ID }})"
+        run: |
+          STAGING="mlx-serve-macos-arm64"
+          mkdir -p "$STAGING/lib"
+
+          cp zig-out/bin/mlx-serve "$STAGING/"
+
+          # License + third-party attributions. The tarball links Apache-2.0
+          # code (MTPLX/dflash/oMLX kernels, jinja.cpp) whose section 4 wants
+          # the license text and the NOTICE attributions to reach whoever
+          # receives the binary — a NOTICE that only lives in the git repo
+          # reaches nobody who downloads a release.
+          cp LICENSE LICENSE-APACHE-2.0 NOTICE "$STAGING/"
+
+          # Self-built mlx + mlx-c (scripts/build-mlx.sh): libmlxc + libmlx +
+          # sibling deps like libjaccl (@rpath-referenced — missing them causes
+          # a "no such file" dyld error at startup) + the NAX-enabled metallib.
+          cp lib/mlx/lib/*.dylib "$STAGING/lib/"
+          cp lib/mlx/lib/mlx.metallib "$STAGING/lib/"
+
+          # WebP libraries for vision pipeline
+          WEBP_LIB="$(brew --prefix webp)/lib"
+          [ -f "$WEBP_LIB/libwebp.dylib" ] && cp "$WEBP_LIB/libwebp.dylib" "$STAGING/lib/"
+          [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$STAGING/lib/"
+
+          # libllama (llama.cpp GGUF engine) — single self-contained dylib staged
+          # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
+          [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$STAGING/lib/"
+
+          install_name_tool -change \
+            @rpath/libmlxc.dylib \
+            @executable_path/lib/libmlxc.dylib \
+            "$STAGING/mlx-serve"
+
+          install_name_tool -change \
+            @rpath/libllama.dylib \
+            @executable_path/lib/libllama.dylib \
+            "$STAGING/mlx-serve" 2>/dev/null || true
+
+          install_name_tool -change \
+            @rpath/libmlx.dylib \
+            @loader_path/libmlx.dylib \
+            "$STAGING/lib/libmlxc.dylib"
+
+          # Add @loader_path to libmlx.dylib's rpath so its @rpath/libjaccl.dylib (and any
+          # future @rpath sibling deps) resolves to the same lib/ dir we just populated.
+          install_name_tool -add_rpath @loader_path "$STAGING/lib/libmlx.dylib" 2>/dev/null || true
+
+          # Fix webp rpaths
+          if [ -f "$STAGING/lib/libwebp.dylib" ]; then
+            install_name_tool -change \
+              "$(otool -L "$STAGING/mlx-serve" | grep libwebp | awk '{print $1}')" \
+              @executable_path/lib/libwebp.dylib \
+              "$STAGING/mlx-serve" 2>/dev/null || true
+            install_name_tool -change \
+              "$(otool -L "$STAGING/lib/libwebp.dylib" | grep libsharpyuv | awk '{print $1}')" \
+              @loader_path/libsharpyuv.dylib \
+              "$STAGING/lib/libwebp.dylib" 2>/dev/null || true
+          fi
+
+          for lib in "$STAGING/lib/"*.dylib; do
+            [ -f "$lib" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$lib"
+          done
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/mlx-serve"
+
+          codesign --verify --deep --strict --verbose=2 "$STAGING/mlx-serve"
+
+          # Smoke test the install_name_tool-rewired binary so missing-dylib
+          # errors surface here rather than after notarization.
+          "./$STAGING/mlx-serve" --version
+
+          ditto -c -k --keepParent "$STAGING" "mlx-serve-cli.zip"
+
+      # ── .app bundle (menu bar app with everything inside) ──
+      - name: Package app bundle
+        env:
+          SIGNING_IDENTITY: "Developer ID Application: David Dalcu (${{ secrets.APPLE_TEAM_ID }})"
+        run: |
+          APP="MLX Core.app"
+          CONTENTS="$APP/Contents"
+          mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Frameworks" "$CONTENTS/Resources"
+
+          # Executables
+          cp "$SWIFT_BIN_PATH/MLXCore" "$CONTENTS/MacOS/MLXCore"
+          cp zig-out/bin/mlx-serve "$CONTENTS/MacOS/mlx-serve"
+
+          # App resources (tray icon etc.)
+          cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
+
+          # This .app is assembled by hand, so SwiftPM's SwaTex font bundle
+          # must be embedded explicitly (Xcode normally does this for us).
+          SWATEX_RESOURCE_BUNDLE="$SWIFT_BIN_PATH/SwaTex_SwaTexRender.bundle"
+          if [ ! -d "$SWATEX_RESOURCE_BUNDLE" ]; then
+            echo "::error::SwaTex font resource bundle missing"
+            exit 1
+          fi
+          cp -R "$SWATEX_RESOURCE_BUNDLE" "$CONTENTS/Resources/"
+
+          # License + third-party attributions inside the bundle (same reason
+          # as the CLI tarball above: the .app embeds the same Apache-2.0
+          # kernels and jinja.cpp). Mirrors app/build.sh.
+          cp LICENSE LICENSE-APACHE-2.0 NOTICE "$CONTENTS/Resources/"
+
+          # vz-agent guest binary — required in EVERY build variant or the
+          # sandbox boots the legacy console shell and MCP servers can never
+          # connect (issue #89). Mirrors app/build.sh.
+          mkdir -p "$CONTENTS/Resources/guest"
+          cp zig-out/guest/vz-agent "$CONTENTS/Resources/guest/vz-agent"
+          if [ ! -f "$CONTENTS/Resources/guest/vz-agent" ]; then
+            echo "::error::vz-agent missing from the app bundle — sandboxed MCP would be broken (issue #89)"
+            exit 1
+          fi
+
+          # Info.plist — stamped with the version this run is releasing.
+          # Without the stamp the bundle ships whatever the committed plist
+          # happens to say: v26.8.1 shipped an app reporting 26.7.12, so
+          # UpdateChecker saw a permanently newer release and installing it
+          # never helped (the new DMG said 26.7.12 too). Stamp the COPY —
+          # the committed plist stays clean.
+          cp app/Info.plist "$CONTENTS/"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleVersion ${{ steps.version.outputs.version }}" \
+            "$CONTENTS/Info.plist"
+          /usr/libexec/PlistBuddy -c \
+            "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" \
+            "$CONTENTS/Info.plist"
+
+          # App icon
+          if [ -f app/appicon.png ]; then
+            ICON_DIR=$(mktemp -d)
+            ICONSET="$ICON_DIR/AppIcon.iconset"
+            mkdir -p "$ICONSET"
+            for size in 16 32 64 128 256 512; do
+              sips -z $size $size app/appicon.png --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
+              double=$((size * 2))
+              sips -z $double $double app/appicon.png --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
+            done
+            iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns" 2>/dev/null || true
+            rm -rf "$ICON_DIR"
+          fi
+
+          # Bundled libraries: self-built mlx + mlx-c (scripts/build-mlx.sh) —
+          # libmlxc + libmlx + sibling deps like libjaccl (@rpath-referenced;
+          # missing siblings cause a dyld "no such file" error at startup) +
+          # the NAX-enabled metallib.
+          cp lib/mlx/lib/*.dylib "$CONTENTS/Frameworks/"
+          cp lib/mlx/lib/mlx.metallib "$CONTENTS/Frameworks/"
+
+          # WebP libraries for vision pipeline
+          WEBP_LIB="$(brew --prefix webp)/lib"
+          [ -f "$WEBP_LIB/libwebp.dylib" ] && cp "$WEBP_LIB/libwebp.dylib" "$CONTENTS/Frameworks/"
+          [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$CONTENTS/Frameworks/"
+
+          # libllama (llama.cpp GGUF engine) — single self-contained dylib staged
+          # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
+          [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$CONTENTS/Frameworks/"
+
+          # YbridOpus + YbridOgg dynamic frameworks (libopus/libogg) pulled by the
+          # SwiftOGG SPM dep — VoicePreprocessor uses them to decode Telegram
+          # Ogg/Opus voice notes. SwiftPM fetched them into app/.build/artifacts;
+          # embed the macOS slice so the app resolves @rpath/Ybrid*.framework at
+          # runtime (without this the .app fails to launch). Mirrors app/build.sh.
+          # NOTE: SwiftPM extracts binary artifacts to .build/artifacts (NOT under
+          # the per-triple bin dir), so go up TWO levels from --show-bin-path
+          # (.build/<triple>/release -> .build) before appending /artifacts.
+          ARTIFACTS="$(dirname "$(dirname "$SWIFT_BIN_PATH")")/artifacts"
+          for fwname in YbridOpus YbridOgg; do
+            fwsrc=$(find "$ARTIFACTS" -path "*macos-arm64*/$fwname.framework" -type d 2>/dev/null | head -1)
+            if [ -n "$fwsrc" ]; then
+              cp -R "$fwsrc" "$CONTENTS/Frameworks/"
+            else
+              echo "::error::$fwname.framework not found under $ARTIFACTS — Telegram voice decode would crash the app"
+              exit 1
+            fi
+          done
+
+          # Fix rpaths
+          install_name_tool -change \
+            "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libmlxc | awk '{print $1}')" \
+            "@executable_path/../Frameworks/libmlxc.dylib" \
+            "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+
+          install_name_tool -change \
+            @rpath/libllama.dylib \
+            "@executable_path/../Frameworks/libllama.dylib" \
+            "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+
+          install_name_tool -change \
+            "$(otool -L "$CONTENTS/Frameworks/libmlxc.dylib" | grep libmlx.dylib | head -1 | awk '{print $1}')" \
+            "@loader_path/libmlx.dylib" \
+            "$CONTENTS/Frameworks/libmlxc.dylib" 2>/dev/null || true
+
+          # Add @loader_path to libmlx.dylib's rpath so its @rpath/libjaccl.dylib (and any other
+          # @rpath sibling deps mlx introduces) resolves to the bundled Frameworks dir.
+          install_name_tool -add_rpath @loader_path "$CONTENTS/Frameworks/libmlx.dylib" 2>/dev/null || true
+
+          # Fix webp rpaths
+          if [ -f "$CONTENTS/Frameworks/libwebp.dylib" ]; then
+            install_name_tool -change \
+              "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libwebp | awk '{print $1}')" \
+              "@executable_path/../Frameworks/libwebp.dylib" \
+              "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+            install_name_tool -change \
+              "$(otool -L "$CONTENTS/Frameworks/libwebp.dylib" | grep libsharpyuv | awk '{print $1}')" \
+              "@loader_path/libsharpyuv.dylib" \
+              "$CONTENTS/Frameworks/libwebp.dylib" 2>/dev/null || true
+          fi
+
+          # MLXCore loads the Ybrid frameworks via @rpath/Ybrid*.framework; point
+          # @rpath at the bundled Frameworks dir (SwiftPM's dev rpath into
+          # .build/artifacts doesn't survive packaging, so without this the app
+          # can't launch). Mirrors app/build.sh.
+          install_name_tool -add_rpath "@executable_path/../Frameworks" "$CONTENTS/MacOS/MLXCore" 2>/dev/null || true
+
+          # Sign inside-out
+          chmod -R u+w "$APP"
+          for fw in "$CONTENTS/Frameworks/"*.metallib "$CONTENTS/Frameworks/"*.dylib; do
+            [ -f "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
+          done
+          # Embedded .framework bundles (YbridOpus/YbridOgg) — re-sign over the
+          # vendor signature with our Developer ID + hardened runtime so dyld
+          # accepts them and notarization passes.
+          for fw in "$CONTENTS/Frameworks/"*.framework; do
+            [ -d "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
+          done
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/mlx-serve"
+          # MLXCore + the .app need the mic entitlement, or Voice mode is denied
+          # microphone access under hardened runtime without ever prompting.
+          # Frameworks/dylibs and the headless mlx-serve must NOT carry it.
+          codesign --force --options runtime --entitlements app/MLXCore.entitlements --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/MLXCore"
+          codesign --force --options runtime --entitlements app/MLXCore.entitlements --sign "$SIGNING_IDENTITY" "$APP"
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" "MLXCore-app.zip"
+
+      # ── Notarize both ──
+      - name: Notarize CLI
+        if: ${{ !inputs.dry_run }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "mlx-serve-cli.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+      - name: Notarize app bundle
+        if: ${{ !inputs.dry_run }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "MLXCore-app.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Staple the app bundle
+          xcrun stapler staple "MLX Core.app"
+          rm -f "MLXCore-app.zip"
+
+      - name: Create DMG installer
+        run: bash scripts/create-dmg.sh "MLX Core.app" MLXCore.dmg
+
+      # ── Package final artifacts ──
+      - name: Package CLI tarball
+        run: tar -czf "mlx-serve-bin-macos-arm64.tar.gz" "mlx-serve-macos-arm64"
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain $RUNNER_TEMP/signing.keychain-db || true
+
+      # Pulls the top entry out of CHANGELOG.md (from its "## v..." heading
+      # down to, but not including, the "---" separator) so the release body
+      # matches what we already wrote by hand instead of GitHub's auto-generated
+      # commit list.
+      - name: Extract changelog entry
+        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
+        id: changelog
+        run: |
+          ENTRY=$(awk '
+            /^## / { c++; if (c==2) exit }
+            /^---$/ { if (c==1) exit }
+            c==1 { print }
+          ' CHANGELOG.md)
+          {
+            echo "notes<<CHANGELOG_EOF"
+            echo "$ENTRY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # The release is created as a DRAFT; the Homebrew formula push happens in
+      # homebrew.yml when the draft is PUBLISHED — pushing it here advertised a
+      # version whose assets weren't downloadable yet.
+      - name: Create Release
+        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: mlx-serve v${{ steps.version.outputs.version }}
+          body: ${{ steps.changelog.outputs.notes }}
+          draft: true
+          files: |
+            mlx-serve-bin-macos-arm64.tar.gz
+            MLXCore.dmg
+
+      - name: Upload PR / dry-run artifacts
+        if: ${{ inputs.dry_run || github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          # PR versions embed the PR number + SHA, so the name is unambiguous
+          # either way (e.g. package-26.7.0-pr12.abc1234 / package-26.7.11).
+          name: package-${{ steps.version.outputs.version }}
+          path: |
+            mlx-serve-bin-macos-arm64.tar.gz
+            MLXCore.dmg
+          retention-days: 7
