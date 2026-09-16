@@ -16,6 +16,7 @@ class ChatModel: ObservableObject {
     @Published var selectedImage: NSImage?
     @Published var selectedImageData: Data?
     @Published var streamTick = 0
+    private var serverProcess: Process?
     
     // Opinionated: smallest model, one port, no knobs - streaming
     let endpoint = "http://127.0.0.1:8081/v1/chat/completions"
@@ -188,6 +189,32 @@ class ChatModel: ObservableObject {
         txt += "Status: running, streaming on, peak 5.21GB text / 5.85GB vision\n"
         txt += "App: SparkleChat 0.1GB, Engine 6.1GB, System 94GB used"
         return txt
+    }
+    
+    func ensureServer() async {
+        // Check if already running
+        if let url = URL(string: "http://127.0.0.1:8081/v1/models"),
+           let (_, resp) = try? await URLSession.shared.data(from: url),
+           let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+            return
+        }
+        // Launch bundled or home model via mlx_vlm.server
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        proc.arguments = ["python3", "-m", "mlx_vlm.server", "--model", model, "--port", "8081"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        try? proc.run()
+        serverProcess = proc
+        // Wait up to 10s for ready
+        for _ in 0..<20 {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if let url = URL(string: "http://127.0.0.1:8081/v1/models"),
+               let (_, resp) = try? await URLSession.shared.data(from: url),
+               let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+                break
+            }
+        }
     }
     
     func handleDrop(providers: [NSItemProvider]) -> Bool {
@@ -404,7 +431,9 @@ struct ContentView: View {
                             Text("Own your AI. No cloud. No token.")
                                 .font(.system(size: 13))
                                 .foregroundStyle(.secondary)
-                            Button(action: { focused = true }) {
+                            Button(action: {
+                                Task { await model.ensureServer(); focused = true }
+                            }) {
                                 Text("Start chatting")
                                     .font(.system(size: 13, weight: .medium))
                                     .padding(.horizontal, 20)
@@ -516,6 +545,9 @@ struct ContentView: View {
             .padding(.vertical, 10)
             .background(Color(nsColor: .windowBackgroundColor))
         }
-        .onAppear { focused = true }
+        .onAppear {
+            focused = true
+            Task { await model.ensureServer() }
+        }
     }
 }
