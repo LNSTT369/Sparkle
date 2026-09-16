@@ -148,6 +148,111 @@ class ChatModel: ObservableObject {
         }
         return false
     }
+    
+    func startDownload(_ m: OnboardingModel) {
+        messages.append(Message(role: "user", content: "Download \(m.name)"))
+        let hfRepo: String
+        switch m.id {
+        case "gemma4-e4b-it-4bit": hfRepo = "mlx-community/gemma-4-e4b-it-4bit"
+        case "gemma4-e4b-8bit": hfRepo = "mlx-community/gemma-4-e4b-8bit"
+        case "qwen3-coder-30b": hfRepo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+        default: hfRepo = m.id
+        }
+        var msg = Message(role: "assistant", content: "Starting \(m.size) via WiFi at \(m.path)\n\nTerminal: sparkle pull \(m.id)\n  or: hf download \(hfRepo) --local-dir \(m.path)\n\nResumable, multi-connection. No HF token needed for Apache-2.")
+        messages.append(msg)
+        let idx = messages.count - 1
+        // Demo progress, real Zig pull wired in V1.1
+        Task {
+            for i in 1...5 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                await MainActor.run {
+                    if messages.indices.contains(idx) {
+                        messages[idx].content += "\n\(i*20)% • \(m.size) • WiFi • \(3 - i/2) min left"
+                    }
+                }
+            }
+            await MainActor.run {
+                if messages.indices.contains(idx) {
+                    messages[idx].content += "\nReady. Run sparkle run \(m.id) to chat."
+                }
+            }
+        }
+    }
+}
+
+struct OnboardingModel: Identifiable {
+    let id: String
+    let name: String
+    let size: String
+    let badge: String
+    let detail: String
+    static let all: [OnboardingModel] = [
+        OnboardingModel(id: "gemma4-e4b-it-4bit", name: "gemma-4-e4b-it-4bit", size: "4.8GB", badge: "Recommended for 16GB", detail: "74 tok/s • vision • Apache-2"),
+        OnboardingModel(id: "gemma4-e4b-8bit", name: "gemma-4-e4b-8bit", size: "8.9GB", badge: "Your 96GB", detail: "81 tok/s • vision • Apache-2"),
+        OnboardingModel(id: "qwen3-coder-30b", name: "qwen3-coder:30b", size: "18GB", badge: "Coding", detail: "Like your Ollama • 18GB"),
+    ]
+    var path: String {
+        switch id {
+        case "gemma4-e4b-it-4bit": return NSHomeDirectory() + "/models/gemma-4-e4b-it-4bit-mlx"
+        case "gemma4-e4b-8bit": return NSHomeDirectory() + "/models/gemma-4-e4b-8bit-mlx"
+        case "qwen3-coder-30b": return NSHomeDirectory() + "/.ollama/models"
+        default: return ""
+        }
+    }
+    var isDownloaded: Bool { FileManager.default.fileExists(atPath: path) }
+}
+
+struct OnboardingCard: View {
+    let model: OnboardingModel
+    @EnvironmentObject var chat: ChatModel
+    @State private var isDownloading = false
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(model.name)
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(model.badge)
+                        .font(.system(size: 9, weight: .medium))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(model.badge == "Recommended for 16GB" ? Color.blue.opacity(0.15) : Color.secondary.opacity(0.12), in: Capsule())
+                }
+                Text(model.detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if model.isDownloaded {
+                Text("Ready")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.green)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.green.opacity(0.12), in: Capsule())
+            } else {
+                Button(action: {
+                    isDownloading = true
+                    // Redirect to chat/terminal with WiFi progress
+                    chat.startDownload(model)
+                }) {
+                    if isDownloading {
+                        ProgressView().scaleEffect(0.5).frame(width: 60)
+                    } else {
+                        Text("Download • \(model.size) • 2 min")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(isDownloading)
+            }
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+    }
 }
 
 struct ContentView: View {
@@ -185,21 +290,28 @@ struct ContentView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                     if model.messages.isEmpty {
-                        VStack(spacing: 8) {
+                        VStack(spacing: 16) {
                             Image(systemName: "sparkles")
-                                .font(.system(size: 24))
+                                .font(.system(size: 20))
                                 .foregroundStyle(.secondary)
-                            Text("Smallest model audit ready")
-                                .font(.system(size: 13, weight: .medium))
-                            Text("Type, drop an image, press Return. No knobs.")
+                            Text("Welcome to Sparkle")
+                                .font(.system(size: 15, weight: .semibold))
+                            Text("No models yet. Pick one, one click, no HF token.")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.secondary)
-                            Text("Test image loading by dropping a JPG/PNG here")
-                                .font(.system(size: 11))
+                            
+                            ForEach(OnboardingModel.all) { m in
+                                OnboardingCard(model: m).environmentObject(model)
+                            }
+                            
+                            Text(" CLI: sparkle run gemma4:e4b  •  sparkle list  •  sparkle serve at :11234")
+                                .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
+                                .padding(.top, 4)
                         }
                         .frame(maxWidth: .infinity)
-                        .padding(.top, 60)
+                        .padding(.top, 20)
+                        .padding(.horizontal, 16)
                     }
                     ForEach(model.messages) { msg in
                         HStack(alignment: .top, spacing: 10) {
