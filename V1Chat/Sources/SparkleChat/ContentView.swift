@@ -417,10 +417,22 @@ struct SettingsView: View {
         VStack(spacing: 16) {
             Text("Settings")
                 .font(.system(size: 14, weight: .semibold))
-            // Models - moved from empty state, now in Settings per Jobs Take
-            ForEach(OnboardingModel.all) { m in
-                OnboardingCard(model: m).environmentObject(chat)
+            HStack(spacing: 8) {
+                Text("Model")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                Text("gemma-4-e4b-it-4bit 4.8GB")
+                    .font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.green.opacity(0.12), in: Capsule())
+                Spacer()
+                Text("Bundled")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
             }
+            .padding(10)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             Divider()
             // Generation - learn from Osaurus ChatSettingsView generationSection
             VStack(alignment: .leading, spacing: 12) {
@@ -450,21 +462,17 @@ struct SettingsView: View {
                         .font(.system(size: 11, design: .monospaced))
                         .frame(width: 28)
                 }
-                Text("Temp 0.7 is balanced, 0 is greedy, 2 is creative. Context is window for continuous memory, 8192 is default, 131072 is max for gemma-4-e4b.")
+                Text("Temp 0.7 is balanced, 0 is greedy, 2 is creative. Context is window for continuous memory, 8192 is default, 131072 is max.")
                     .font(.system(size: 9))
                     .foregroundStyle(.secondary)
             }
             .padding(12)
             .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-            Text("CLI hidden until fans. No sparkle list, no serve, no Ollama 11434 in V1.")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
             Button("Done") { dismiss() }
                 .buttonStyle(.borderedProminent)
         }
         .padding(20)
-        .frame(width: 420)
+        .frame(width: 380)
     }
 }
 
