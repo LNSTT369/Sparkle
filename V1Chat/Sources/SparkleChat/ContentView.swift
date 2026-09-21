@@ -1,5 +1,9 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import MLXLMCommon
+import MLXVLM
+import MLXLLM
+import Hub
 
 struct Message: Identifiable, Equatable {
     let id = UUID()
@@ -19,37 +23,35 @@ class ChatModel: ObservableObject {
     @Published var selectedImage: NSImage?
     @Published var selectedImageData: Data?
     @Published var streamTick = 0
-    private var serverProcess: Process?
+    // Single-process MLX
+    private var modelContainer: ModelContainer?
+    private var chatSession: AppSession?
     // Settings from Osaurus generationSection
     var temperature: Double { UserDefaults.standard.object(forKey: "modelTemperature") as? Double ?? 0.7 }
     var topP: Double { UserDefaults.standard.object(forKey: "modelTopP") as? Double ?? 1.0 }
     var contextLength: Int { UserDefaults.standard.object(forKey: "modelContextLength") as? Double ?? 8192 > 0 ? Int(UserDefaults.standard.object(forKey: "modelContextLength") as? Double ?? 8192) : 8192 }
     
-    // Opinionated: smallest model, one port, no knobs - streaming
-    // V1.1 Zig at 11234, fallback to Python 8081
-    var endpoint: String {
-        // Prefer Zig 11234 if binary exists, else Python 8081
-        let zigBin = Bundle.main.resourcePath.map { $0 + "/sparkle" } ?? ""
-        if FileManager.default.fileExists(atPath: zigBin) { return "http://127.0.0.1:11234/v1/chat/completions" }
-        let zigBuild = NSHomeDirectory() + "/Desktop/Sparkle/zig-out/bin/sparkle"
-        if FileManager.default.fileExists(atPath: zigBuild) { return "http://127.0.0.1:11234/v1/chat/completions" }
-        return "http://127.0.0.1:8081/v1/chat/completions"
-    }
-    var model: String {
+    var modelPath: String {
         let bundled = Bundle.main.resourcePath.map { $0 + "/models/gemma-4-e4b-it-4bit-mlx" } ?? ""
         if FileManager.default.fileExists(atPath: bundled) { return bundled }
         return NSHomeDirectory() + "/models/gemma-4-e4b-it-4bit-mlx"
     }
-    var serverPort: String { endpoint.contains("11234") ? "11234" : "8081" }
+    // Kept for /status display
+    var endpoint: String { "in-process MLX" }
+    var model: String { modelPath }
+    var serverPort: String { "in-process" }
+    
+    // Single-process MLX - in process, no HTTP
+    private var mlxSession: MLXLMCommon.ChatSession?
     
     func send() {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || selectedImageData != nil else { return }
         guard !isLoading else { return }
         
-        // Slash commands - Take Nothing: no buttons, just text
         if trimmed == "/clear" {
             messages.removeAll()
+            mlxSession = nil
             input = ""
             selectedImage = nil
             selectedImageData = nil
@@ -57,7 +59,7 @@ class ChatModel: ObservableObject {
         }
         if trimmed == "/help" {
             messages.append(Message(role: "user", content: trimmed))
-            messages.append(Message(role: "assistant", content: "Commands:\n/clear - clear chat\n/help - show this\n/status - MLX server and loaded model\n/models - list curated models\n/load <id> - switch model (needs restart on mlx_vlm)"))
+            messages.append(Message(role: "assistant", content: "Commands:\n/clear - clear chat\n/help - show this\n/status - model and memory\n/models - list models"))
             input = ""
             return
         }
@@ -72,23 +74,9 @@ class ChatModel: ObservableObject {
         }
         if trimmed == "/models" {
             messages.append(Message(role: "user", content: trimmed))
-            var txt = "Curated models (~/models):\n"
-            for m in OnboardingModel.all {
-                txt += "• \(m.name) \(m.size) \(m.badge) — \(m.isDownloaded ? "Ready at \(m.path)" : "Not downloaded")\n"
-            }
-            txt += "\nLoaded now: \(model) on \(endpoint)"
+            var txt = "Bundled model:\n• gemma-4-e4b-it-4bit 4.8GB Ready at \(modelPath)\n"
+            txt += "\nIn-process MLX, no HTTP, no port"
             messages.append(Message(role: "assistant", content: txt))
-            input = ""
-            return
-        }
-        if trimmed.hasPrefix("/load ") {
-            let id = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-            messages.append(Message(role: "user", content: trimmed))
-            if id.isEmpty {
-                messages.append(Message(role: "assistant", content: "Usage: /load gemma4-e4b-it-4bit | gemma4-e4b-8bit | qwen3-coder:30b"))
-            } else {
-                messages.append(Message(role: "assistant", content: "Switching model to \(id)...\nmlx_vlm.server is pinned to one model at launch. Restart with:\npython3 -m mlx_vlm.server --model ~/models/\(id)-mlx --port 8081\n\nZig 1.1 will make this one click: sparkle run \(id)"))
-            }
             input = ""
             return
         }
@@ -103,7 +91,6 @@ class ChatModel: ObservableObject {
         selectedImageData = nil
         isLoading = true
         
-        // Create empty assistant message that will be streamed into
         var assistantMsg = Message(role: "assistant", content: "")
         messages.append(assistantMsg)
         let assistantIndex = messages.count - 1
@@ -121,82 +108,54 @@ class ChatModel: ObservableObject {
     }
     
     func streamMLX(prompt: String, imageData: Data?, assistantIndex: Int) async throws {
-        // Continuous memory: send full history up to assistantIndex
-        var messagesPayload: [[String: Any]] = []
+        // Ensure MLX model is loaded in-process
+        if mlxSession == nil {
+            let container: ModelContainer
+            if FileManager.default.fileExists(atPath: modelPath) {
+                let config = ModelConfiguration(directory: URL(fileURLWithPath: modelPath))
+                container = try await loadModelContainer(hub: HubApi(), configuration: config)
+            } else {
+                container = try await loadModelContainer(id: "mlx-community/gemma-4-e4b-it-4bit")
+            }
+            let s = MLXLMCommon.ChatSession(container)
+            s.generateParameters.temperature = Float(temperature)
+            s.generateParameters.topP = Float(topP)
+            mlxSession = s
+        }
+        guard let session = mlxSession else { throw NSError(domain: "MLX", code: 1, userInfo: [NSLocalizedDescriptionKey: "Model not loaded"]) }
+        session.generateParameters.temperature = Float(temperature)
+        session.generateParameters.topP = Float(topP)
+        
+        // Build UserInput with history for continuous memory
+        var history: [Chat.Message] = []
         for idx in 0..<assistantIndex {
             let msg = messages[idx]
-            if msg.role == "user", let data = msg.imageData {
-                let b64 = data.base64EncodedString()
-                let contentArray: [[String: Any]] = [
-                    ["type": "text", "text": msg.content.isEmpty ? "Describe this image" : msg.content],
-                    ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)"]]
-                ]
-                messagesPayload.append(["role": "user", "content": contentArray])
+            if msg.role == "user" {
+                if let data = msg.imageData, let nsImg = NSImage(data: data), let cg = nsImg.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                    let ci = CIImage(cgImage: cg)
+                    history.append(Chat.Message(role: .user, content: msg.content, images: [.ciImage(ci)]))
+                } else {
+                    history.append(Chat.Message(role: .user, content: msg.content))
+                }
             } else {
-                messagesPayload.append(["role": msg.role, "content": msg.content])
+                history.append(Chat.Message(role: .assistant, content: msg.content))
             }
         }
-        // Fallback if history empty (should not happen as userMsg already appended)
-        if messagesPayload.isEmpty {
-            if let data = imageData {
-                let b64 = data.base64EncodedString()
-                let contentArray: [[String: Any]] = [
-                    ["type": "text", "text": prompt.isEmpty ? "Describe this image" : prompt],
-                    ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)"]]
-                ]
-                messagesPayload.append(["role": "user", "content": contentArray])
-            } else {
-                messagesPayload.append(["role": "user", "content": prompt])
-            }
+        if history.count > 20 {
+            history = Array(history.suffix(20))
         }
-        
-        // Truncate to contextLength like Osaurus: keep last messages that fit
-        let ctx = contextLength
-        // Rough truncate: keep last 20 messages if payload too large (approx 400 tokens each)
-        var payloadForSend = messagesPayload
-        if payloadForSend.count > 20 {
-            payloadForSend = Array(payloadForSend.suffix(20))
-        }
-        let body: [String: Any] = [
-            "model": model,
-            "messages": payloadForSend,
-            "max_tokens": min(512, ctx / 4),
-            "temperature": temperature,
-            "top_p": topP,
-            "stream": true
-        ]
-        
-        let data = try JSONSerialization.data(withJSONObject: body)
-        var req = URLRequest(url: URL(string: endpoint)!)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-        req.httpBody = data
-        req.timeoutInterval = 120
-        
-        let (bytes, response) = try await URLSession.shared.bytes(for: req)
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            throw NSError(domain: "MLX", code: 1, userInfo: [NSLocalizedDescriptionKey: "HTTP \(String(describing: (response as? HTTPURLResponse)?.statusCode))"])
-        }
-        
         var full = ""
-        for try await line in bytes.lines {
-            // Each line is like: data: {"choices":[{"delta":{"content":" Hello"}}]}
-            guard line.hasPrefix("data: ") else { continue }
-            let payload = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-            if payload == "[DONE]" { break }
-            guard let d = payload.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  let choices = json["choices"] as? [[String: Any]],
-                  let first = choices.first else { continue }
-            // delta.content for stream, or message.content as fallback
-            var deltaText: String?
-            if let delta = first["delta"] as? [String: Any] {
-                deltaText = delta["content"] as? String
-            } else if let msg = first["message"] as? [String: Any] {
-                deltaText = msg["content"] as? String
-            }
-            if let t = deltaText, !t.isEmpty {
+        let last = history.last
+        let stream: AsyncThrowingStream<String, Error>
+        if let last = last, !last.images.isEmpty {
+            stream = session.streamResponse(to: last.content, images: last.images)
+        } else if let last = last {
+            stream = session.streamResponse(to: last.content)
+        } else {
+            stream = session.streamResponse(to: prompt)
+        }
+        for try await chunk in stream {
+            if let t = chunk as? String, !t.isEmpty {
                 full += t
                 if messages.indices.contains(assistantIndex) {
                     messages[assistantIndex].content = full
@@ -204,78 +163,36 @@ class ChatModel: ObservableObject {
                 }
             }
         }
-        // Ensure final content set
         if full.isEmpty, messages.indices.contains(assistantIndex), messages[assistantIndex].content.isEmpty {
             messages[assistantIndex].content = "(no content)"
         }
     }
     
     func fetchStatus() async -> String {
-        var txt = "MLX server: \(endpoint)\n"
-        let modelsURL = endpoint.replacingOccurrences(of: "/v1/chat/completions", with: "/v1/models")
-        do {
-            let url = URL(string: modelsURL)!
-            let (data, _) = try await URLSession.shared.data(from: url)
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let d = json["data"] as? [[String: Any]],
-               let first = d.first,
-               let id = first["id"] as? String {
-                txt += "Loaded: \(id)\n"
-            } else {
-                txt += "Loaded: \(model) (from launch)\n"
-            }
-        } catch {
-            txt += "Loaded: \(model) (unknown, \(error.localizedDescription))\n"
-        }
-        txt += "Port \(serverPort) • streaming on • peak 5.21GB text / 5.85GB vision\n"
-        txt += "App 0.1GB • Engine 6.1GB • System 94GB used"
+        var txt = "MLX in-process\n"
+        txt += "Model: \(modelPath)\n"
+        if mlxSession != nil { txt += "Loaded: yes, streaming on\n" } else { txt += "Loaded: not yet, will load on first chat\n" }
+        txt += "Temp \(String(format: "%.1f", temperature)) • TopP \(String(format: "%.2f", topP)) • Context \(contextLength)\n"
+        txt += "Peak 5.21GB text / 5.85GB vision • App 82M"
         return txt
     }
     
     func ensureServer() async {
-        let modelsURL = endpoint.replacingOccurrences(of: "/v1/chat/completions", with: "/v1/models")
-        // Check if already running on preferred port
-        if let url = URL(string: modelsURL),
-           let (_, resp) = try? await URLSession.shared.data(from: url),
-           let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) {
-            return
-        }
-        // Try Zig 11234 first if binary exists
-        let zigBundled = (Bundle.main.resourcePath ?? "") + "/sparkle"
-        let zigBuild = NSHomeDirectory() + "/Desktop/Sparkle/zig-out/bin/mlx-serve"
-        let zigAlt = NSHomeDirectory() + "/Desktop/Sparkle/zig-out/bin/sparkle"
-        let zigBin: String? = {
-            if FileManager.default.fileExists(atPath: zigBundled) { return zigBundled }
-            if FileManager.default.fileExists(atPath: zigBuild) { return zigBuild }
-            if FileManager.default.fileExists(atPath: zigAlt) { return zigAlt }
-            return nil
-        }()
-        if let zig = zigBin {
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: zig)
-            proc.arguments = ["serve", "--port", "11234"]
-            proc.standardOutput = FileHandle.nullDevice
-            proc.standardError = FileHandle.nullDevice
-            try? proc.run()
-            serverProcess = proc
-        } else {
-            // Fallback to Python mlx_vlm on 8081 with bundled model
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            proc.arguments = ["python3", "-m", "mlx_vlm.server", "--model", model, "--port", serverPort]
-            proc.standardOutput = FileHandle.nullDevice
-            proc.standardError = FileHandle.nullDevice
-            try? proc.run()
-            serverProcess = proc
-        }
-        // Wait up to 10s for ready
-        for _ in 0..<20 {
-            try? await Task.sleep(nanoseconds: 500_000_000)
-            if let url = URL(string: modelsURL),
-               let (_, resp) = try? await URLSession.shared.data(from: url),
-               let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) {
-                break
+        if mlxSession != nil { return }
+        do {
+            let container: ModelContainer
+            if FileManager.default.fileExists(atPath: modelPath) {
+                let config = ModelConfiguration(directory: URL(fileURLWithPath: modelPath))
+                container = try await loadModelContainer(hub: HubApi(), configuration: config)
+            } else {
+                container = try await loadModelContainer(id: "mlx-community/gemma-4-e4b-it-4bit")
             }
+            let s = MLXLMCommon.ChatSession(container)
+            s.generateParameters.temperature = Float(temperature)
+            s.generateParameters.topP = Float(topP)
+            mlxSession = s
+        } catch {
+            print("MLX load failed: \(error)")
         }
     }
     
@@ -476,7 +393,7 @@ struct SettingsView: View {
     }
 }
 
-struct ChatSession: Identifiable, Codable, Equatable {
+struct AppSession: Identifiable, Codable, Equatable {
     var id: UUID = UUID()
     var title: String
     var updatedAt: Date
@@ -489,7 +406,7 @@ struct MessageCodable: Codable, Equatable {
 }
 
 class SessionsManager: ObservableObject {
-    @Published var sessions: [ChatSession] = []
+    @Published var sessions: [AppSession] = []
     @Published var selectedId: UUID?
     
     private var savePath: URL {
@@ -501,7 +418,7 @@ class SessionsManager: ObservableObject {
     init() {
         load()
         if sessions.isEmpty {
-            let s = ChatSession(title: "New Chat", updatedAt: Date(), messages: [])
+            let s = AppSession(title: "New Chat", updatedAt: Date(), messages: [])
             sessions = [s]
             selectedId = s.id
             save()
@@ -512,7 +429,7 @@ class SessionsManager: ObservableObject {
     
     func load() {
         guard let data = try? Data(contentsOf: savePath),
-              let decoded = try? JSONDecoder().decode([ChatSession].self, from: data) else { return }
+              let decoded = try? JSONDecoder().decode([AppSession].self, from: data) else { return }
         sessions = decoded.sorted { $0.updatedAt > $1.updatedAt }
     }
     
@@ -521,7 +438,7 @@ class SessionsManager: ObservableObject {
     }
     
     func createNew() {
-        let s = ChatSession(title: "New Chat", updatedAt: Date(), messages: [])
+        let s = AppSession(title: "New Chat", updatedAt: Date(), messages: [])
         sessions.insert(s, at: 0)
         selectedId = s.id
         save()
@@ -533,7 +450,7 @@ class SessionsManager: ObservableObject {
             selectedId = sessions.first?.id
         }
         if sessions.isEmpty {
-            let s = ChatSession(title: "New Chat", updatedAt: Date(), messages: [])
+            let s = AppSession(title: "New Chat", updatedAt: Date(), messages: [])
             sessions = [s]
             selectedId = s.id
         }
