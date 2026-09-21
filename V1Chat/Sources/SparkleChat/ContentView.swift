@@ -148,11 +148,11 @@ class ChatModel: ObservableObject {
         let last = history.last
         let stream: AsyncThrowingStream<String, Error>
         if let last = last, !last.images.isEmpty {
-            stream = session.streamResponse(to: last.content, images: last.images)
+            stream = session.streamResponse(to: last.content, images: last.images, videos: [])
         } else if let last = last {
-            stream = session.streamResponse(to: last.content)
+            stream = session.streamResponse(to: last.content, images: [], videos: [])
         } else {
-            stream = session.streamResponse(to: prompt)
+            stream = session.streamResponse(to: prompt, images: [], videos: [])
         }
         for try await chunk in stream {
             if let t = chunk as? String, !t.isEmpty {
